@@ -1839,10 +1839,7 @@ class AgentActivity(RecognitionHooks):
         self._session._on_error(error)
 
     def _on_overlap_speech_ended(self, ev: inference.OverlappingSpeechEvent) -> None:
-        if ev.is_interruption:
-            self._interruption_detected = True
-        else:
-            self._interruption_detected = False
+        self._interruption_detected = ev.is_interruption
         self._session.emit("overlapping_speech", ev)
 
     def _on_input_speech_started(self, _: llm.InputSpeechStartedEvent) -> None:
@@ -2265,6 +2262,7 @@ class AgentActivity(RecognitionHooks):
             # TODO(theomonnom): should we "forward" this new turn to the next agent/activity?
             return True
 
+        # avoid interruption if the new_transcript is too short
         if (
             self.stt is not None
             and self._turn_detection != "manual"
@@ -2276,7 +2274,31 @@ class AgentActivity(RecognitionHooks):
             < self._session.options.interruption["min_words"]
         ):
             self._cancel_preemptive_generation()
-            # avoid interruption if the new_transcript is too short
+            return False
+
+        # avoid interruption if backchannel is detected with realtime model
+        if (
+            self.stt is None
+            and self._turn_detection != "manual"
+            and isinstance(self.llm, llm.RealtimeModel)
+            and not self._rt_turn_detection_enabled
+            and self._interruption_detection_enabled
+            and (
+                # confirmed backchannel for this turn (survives the agent stopping)
+                info.backchannel_over_agent
+                # or agent still speaking with nothing flagged yet
+                or (
+                    not self._interruption_detected
+                    and self._current_speech is not None
+                    and not self._current_speech.interrupted
+                )
+            )
+        ):
+            self._cancel_preemptive_generation()
+            # no transcript to gatekeep for realtime barge-in — drop the backchannel turn
+            # and clear the buffered audio so it can't leak into the next committed turn
+            if self._rt_session is not None:
+                self._rt_session.clear_audio()
             return False
 
         old_task = self._user_turn_completed_atask
@@ -4329,13 +4351,22 @@ class AgentActivity(RecognitionHooks):
         return self._session._using_default_vad
 
     def _resolve_interruption_detection(self) -> inference.AdaptiveInterruptionDetector | None:
-        if not (
-            self.stt is not None
-            and self.stt.capabilities.aligned_transcript
-            and self.stt.capabilities.streaming
-            and self.vad is not None
-            and self._turn_detection not in ("manual", "realtime_llm")
-            and not isinstance(self.llm, llm.RealtimeModel)
+        realtime_llm = self.llm if isinstance(self.llm, llm.RealtimeModel) else None
+        if realtime_llm is not None:
+            # realtime commits turns manually; barge-in withholds the commit, so no STT is needed
+            can_gatekeep = not self._rt_turn_detection_enabled
+        else:
+            # the STT pipeline gatekeeps by holding and flushing transcripts
+            can_gatekeep = (
+                self.stt is not None
+                and self.stt.capabilities.aligned_transcript
+                and self.stt.capabilities.streaming
+            )
+
+        if (
+            not can_gatekeep
+            or self.vad is None
+            or self._turn_detection in ("manual", "realtime_llm")
         ):
             if (
                 is_given(self._agent.interruption_detection)
